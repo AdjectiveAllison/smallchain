@@ -1,38 +1,46 @@
-### Working with Gin servers
+# Working with Gin Servers
 
-Gin provides a powerful context object that be used to read request information and send down response information.
+This guide provides best practices for working with Gin HTTP servers in the Agent Control Plane codebase.
 
-For example
+## Overview
 
+Gin provides a powerful context object (`*gin.Context`) that can be used to read request information and send response data. However, it's important to structure Gin endpoints properly to ensure maintainability, testability, and to avoid common pitfalls.
+
+## Key Principles
+
+1. **Keep handlers thin** - HTTP handlers should focus only on HTTP concerns
+2. **Separate business logic** - Move all business logic to separate functions
+3. **Pass request context** - Always pass `c.Request.Context()` to business logic functions
+4. **Return early after responses** - Always `return` immediately after calling response methods on `c`
+5. **Centralize error handling** - Use consistent error handling patterns
+
+## Common Gin Patterns
+
+### Accessing Request Context
+
+```go
+ctx := c.Request.Context()
 ```
-c.Request.Context()
-```
 
-```
+### Sending JSON Responses
+
+```go
 c.JSON(http.StatusOK, gin.H{"message": "Hello, World!"})
 ```
 
-However, gin workflows can be a bit hard to read, and can lead to subtle bugs around 
-when to `return` after calling methods on `c` that generate responses.
+## Anti-Pattern Example
 
-To mitigate this, all gin endpoint should be short and encapsulate all
-logic that relies on the gin context.
-
-The following method is bad for a few reasons:
-
-- need to remember to `return` after calling methods on `c` that generate responses
-- hard to tell from the signature what the method's input/outputs are
-- duplicated error handling code makes it easy to sprawl different handling logic
-- side-effecting functions (methods on `c`) are woven throughout what could be a mostly-pure (and therefore easy to test) function
+The following pattern should be avoided as it makes code hard to maintain and test:
 
 ```go
+// ❌ AVOID: This approach mixes HTTP and business logic
 func (s *Server) createUser(c *gin.Context) {
     var user User
     if err := c.ShouldBindJSON(&user); err != nil {
         c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
         return
     }
-    // do stuff with the user inline
+    // Business logic mixed with HTTP concerns
     // ... many lines of code
     if someErrorCondition {
         c.JSON(http.StatusBadRequest, gin.H{"error": "some error"})
@@ -48,44 +56,115 @@ func (s *Server) createUser(c *gin.Context) {
 }
 ```
 
-you should ALWAYS move business logic out of gin handlers and into a separate function with a clean type signature. Methods that handle business logic should not know about gin or http.
+This approach has several issues:
+- Need to remember to `return` after calling methods on `c` that generate responses
+- Hard to tell from the signature what the method's input/outputs are
+- Duplicated error handling code makes it easy to introduce inconsistencies
+- Side-effecting functions (methods on `c`) are woven throughout what could be mostly pure business logic
+
+## Recommended Pattern
+
+Instead, separate business logic from HTTP concerns:
 
 ```go
+// ✅ RECOMMENDED: Pure business logic function with clean signature
 func createUser(ctx context.Context, user User) (*User, error) {
-    // ... do stuff with user
-    // many lines of code
+    // ... business logic without HTTP concerns
     if someErrorCondition {
         return nil, errors.New("some error")
     }
-    // ... many more lines of code
+    // ... more business logic
     if someOtherErrorCondition {
         return nil, errors.New("some other error")
     }
-    // ... many more lines of code
+    // ... finalize business logic
     return &user, nil
 }
+
+// Thin HTTP handler that only deals with HTTP concerns
 func (s *Server) createUserHandler(c *gin.Context) {
     var user User
-    // validate in gin handler
+    // Handle request parsing
     if err := c.ShouldBindJSON(&user); err != nil {
         c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
         return
     }
-    // business logic doesn't know about gin
+    
+    // Call business logic with context
     user, err := createUser(c.Request.Context(), user)
     if err != nil {
         c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
         return
     }
+    
+    // Send response
     c.JSON(http.StatusOK, user)
 }
 ```
 
-this will lead to a more readable and maintainable function. Benefits include
+This approach provides several benefits:
+- Decouples business logic from HTTP/Gin interfaces
+- Enables business logic to be used in different contexts (e.g., CLI, queue workers)
+- Methods return standard error types for consistent error handling
+- Type signatures make it easy to understand inputs and outputs
+- Business logic is easier to test without mocking Gin
 
-- decouples important business logic from gin interfaces
-- can switch off gin or use business logic in non-gin contexts (e.g. CLI, queue workers, etc)
-- methods can return a standard error type, without having gin-specific error handling code 
-    - (can still define a custom type like ErrInvalid and map that to error codes like 4xx, 5xx, etc in the gin handler)
-- type signatures in biz logic make it easy to understand what is happening
-- easier to test business logic without having to mock gin or test gin internals
+## Implementation Example
+
+ACP implements this pattern in the API server (`internal/server/server.go`). For example, notice how routes are registered and handlers are kept thin:
+
+```go
+// registerRoutes sets up all API endpoints
+func (s *APIServer) registerRoutes() {
+    // Health check endpoint (unversioned)
+    s.router.GET("/status", s.getStatus)
+
+    // API v1 routes
+    v1 := s.router.Group("/v1")
+
+    // Task endpoints
+    tasks := v1.Group("/tasks")
+    tasks.GET("", s.listTasks)
+    tasks.GET("/:id", s.getTask)
+    tasks.POST("", s.createTask)
+    
+    // Agent endpoints
+    agents := v1.Group("/agents")
+    agents.GET("", s.listAgents)
+    agents.GET("/:name", s.getAgent)
+    agents.POST("", s.createAgent)
+    agents.PUT("/:name", s.updateAgent)
+    agents.DELETE("/:name", s.deleteAgent)
+}
+```
+
+## Best Practices
+
+1. **Handler Organization**:
+   - Register all routes in a central location (`registerRoutes`)
+   - Group related endpoints (`v1.Group("/tasks")`)
+   - Use consistent naming (`listTasks`, `getTask`, `createTask`)
+
+2. **Error Handling**:
+   - Use consistent HTTP status codes for different error types
+   - Format error responses consistently (`c.JSON(status, gin.H{"error": err.Error()})`)
+   - Consider creating error helper functions for common patterns
+
+3. **Input Validation**:
+   - Validate input in the handler before passing to business logic
+   - Return early with a 400 status for validation errors
+   - Consider using struct tags for validation (`binding:"required"`)
+
+4. **Context Propagation**:
+   - Always pass `c.Request.Context()` to business logic functions
+   - Respect cancellation in long-running operations
+   - Use context for request-scoped values like trace IDs
+
+5. **Testing**:
+   - Test business logic functions directly without Gin
+   - Use httptest for testing handlers
+   - Consider table-driven tests for handlers with different inputs
+
+## Conclusion
+
+By keeping Gin handlers thin and focused on HTTP concerns, you'll create more maintainable, testable, and reusable code. This pattern is particularly important in a Kubernetes operator where the same business logic might be used in different contexts (API server, controllers, CLI tools, etc.).
